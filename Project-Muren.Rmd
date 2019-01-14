@@ -1,0 +1,472 @@
+---
+title: "Analysis of the joyfulness of music"
+author: "Jesper Muren 880214-0171"
+date: '`r Sys.Date()`'
+output:
+  html_document: default
+  github_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+
+```{r}
+#Packages used
+library(spotifyr)
+library(Rspotify)
+library(tidyverse)
+library(httr)
+library(rvest)
+library(textcat)
+library(tidytext)
+library(rworldmap)
+library(knitr)
+library(scales)
+library(reshape2)
+library(gridExtra)
+library(ggdendro)
+library(wordcloud)
+
+```
+
+#Introduction
+
+Everyone has heard of, or experienced the fact that music can make you happy, but what kind of music is it that has this effect, what is the reason it makes us happy and where can I find it? This among other things is what we will explore in this blogpost. We'll mainly use data obtained from spotify via their API using the packages spotifyr found at https://github.com/charlie86/spotifyr and rspotify found at https://github.com/tiagomendesdantas/Rspotify aswell as data from the world happiness report that we scrape from https://en.wikipedia.org/wiki/World_Happiness_Report.
+
+```{r, eval = FALSE}
+#This entire chunk is set to "eval = FALSE" to not evaluate, data collection was done at an 
+#earlier stage and written to csv as it can be time consuming and the toplists change from 
+#day to day which could cause problems.
+
+##playlists
+
+##These first threee lines are ID's and passwords for using spotifys API that you need to get to 
+#be able to use it directly or through a wrapper like spotifyr.
+
+Sys.setenv(SPOTIFY_CLIENT_ID = 'xxxxxxxxxxxxxxxxx')
+Sys.setenv(SPOTIFY_CLIENT_SECRET = 'xxxxxxxxxxxxxxxxx')
+access_token <- get_spotify_access_token()
+
+#This gets named users playlists and cointained tracks from spotify
+nation_toplists <- get_user_playlists("jmuren") %>% 
+  get_playlist_tracks()
+
+#This spotifyr function gets all the features spotify has for the songs in our playlists.
+track_features <- get_track_audio_features(nation_toplists)
+
+#Join playlists and features into one table
+toplist_features <- left_join(nation_toplists, track_features, by = "track_uri")
+
+write.csv(toplist_features, file = "toplist_features.csv")
+
+#This code uses spotifyr to get the lyrics for each song available at genius.com and removes
+#some tracks which had track names that couldnt be read aswell as duplicate songs.
+lyrics <- toplist_features %>%  
+  select(artist_name, track_name) %>% 
+  distinct() %>% 
+  filter(!str_detect(track_name, "\\<")) %>% 
+  add_genius(artist_name, track_name, type = "lyrics")
+
+write.csv(lyrics, file = "lyrics.csv")
+
+##genres
+
+#Key used to package rspotify similar to the ID's and passwords for spotifyr above
+keys <- spotifyOAuth('xxxxxxxxxxxxxxxxx', 'xxxxxxxxxxxxxxxxx', 'xxxxxxxxxxxxxxxxx')
+
+#This code condenses the artist list to only unique artist 
+distinct_artists <- toplist_features %>% 
+  mutate(artist = as.character(artist_name)) %>% 
+  select(artist) %>% 
+  distinct()
+
+#This code makes a dataframe with artist and their genres using the Rspotify package, there was a problem 
+#with creating a URL for some of the artist names so we catch those errors and set their genre to NA
+artist_genres1 <- character(length(nrow(distinct_artists)))
+artist_genres2 <- character(length(nrow(distinct_artists)))
+
+ for(i in seq_along(distinct_artists[[1]])){
+   tryCatch({
+   artist_genres1[i] <- distinct_artists[[1]][i]
+   artist_genres2[i] <- searchArtist(distinct_artists[[1]][i], token = keys)$genres[1]
+   }, error = function(e) NA)
+   
+ }
+
+artist_genres <- data.frame(artist = artist_genres1, genres = artist_genres2)
+
+write.csv(artist_genres, file = "artist_genres.csv")
+
+```
+
+```{r}
+#We scrape table of world happines report for 2018 from wikipedia
+WHR <- read_html("https://en.wikipedia.org/wiki/World_Happiness_Report") %>% 
+  html_table(fill = TRUE)
+
+WHR_tab <- WHR[[5]] %>% select(Country, Score)
+
+```
+
+Now that we have acquired all the data we'll want to analyse it requires some tidying and combining to make it easily useable for our purposes. 
+
+An example of this is how we handle genres, as spotify only has genre information for artists and not individual songs some artist have several genres attached to them. Another problem with the obtained genre information is that it is way to specific for our needs, making the amount of observations per genre too small to perform a meaningful analysis. 
+
+Too remedy this we put the very specific genre descriptions into 5 broader genres, we well use the genres rock, pop, hip hop, electro and R&B. The divison of subgenres is loosely based on the list of genres and subgenres found at https://en.wikipedia.org/wiki/List_of_popular_music_genres.
+
+```{r, warning = FALSE}
+#read and save data that we acquired earlier
+artist_genres <- read.csv("artist_genres.csv")
+read_lyrics <- read.csv("lyrics.csv")
+toplist_features <- read.csv("toplist_features.csv")
+
+#This code merges the lyrics for each song into one row instead of multiple and then uses the package textcat to identify the language of the lyrics, it sometimes miss identifies english as scots which is corrected
+language_lyrics <- read_lyrics %>% 
+  select(-c(1,4,6)) %>%
+  group_by(artist_name, track_name) %>% 
+  mutate(lyric = paste0(lyric, sep = " ", collapse ="")) %>% 
+  distinct() %>% 
+  mutate(language = ifelse(textcat(lyric) == "scots", "english" ,textcat(lyric)),
+         language = ifelse(language == "middle_frisian", "dutch", language))
+
+
+#We create a dataframe with word sentiments using the lexicon AFINN from the package tidytext
+sentiment_scores <- sentiments %>%
+  filter(lexicon == "AFINN") %>% 
+  select(1,4)
+
+
+#Function that takes lyrics as a string and returns avg sentiment of lyrics
+avg_sentiment <- function(lyric){
+  avg_sentiment = as.data.frame(lyric) %>% 
+    mutate(lyric = str_replace_all(sapply(lyric, tolower), pattern = "[:punct:]",
+                                   replacement = " ")) %>% 
+    separate_rows(lyric, sep = " ") %>% 
+    inner_join(sentiment_scores, by = c("lyric" = "word")) %>%
+    summarize(mean(score))
+  
+  return(avg_sentiment[[1]])
+}
+
+#This code looks through the different genres we got from spotify and place them into a more general genre,
+#in wide format with one column for each chosen genre contining 1 if artist is in that genre and 0 otherwise
+ag_wide<- artist_genres %>% mutate(rock = ifelse(str_detect(genres, "rock|metal"), 1, 0),
+                         pop = ifelse(str_detect(genres, "pop|adult standards"), 1, 0),
+                         `hip hop` = ifelse(str_detect(genres, "hip hop|rap|trap"), 1, 0),
+                         electro = ifelse(str_detect(genres, "electr|edm|house"), 1, 0),
+                         rnb = ifelse(str_detect(genres, "r\\&b"), 1, 0)) %>%  
+  select(-c(genres,X)) %>% distinct()
+
+#add average sentiment to each song with english lyrics
+english_lyrics <- language_lyrics %>% filter(language == "english") %>% 
+  mutate(sentiment = avg_sentiment(lyric)) %>% 
+  select(-c(lyric, language))
+  
+
+#Join all our separate lists together, clean up some unwanted columns and rename all playlists
+#after just country name
+toplist <- toplist_features %>%
+  mutate(playlist_name = str_replace_all(playlist_name, pattern = " Top|50", replacement = ""),
+         playlist_name = trimws(playlist_name, "right")) %>%      
+  left_join(ag_wide,by = c("artist_name" = "artist")) %>% 
+  left_join(language_lyrics, by = c("artist_name", "track_name")) %>% 
+  left_join(english_lyrics, by = c("artist_name", "track_name")) %>% 
+  left_join(WHR_tab, by = c("playlist_name" = "Country")) %>% 
+  select(-c(X,  playlist_img, album_img, track_uri, track_added_at))
+  
+
+```
+
+Now all the data we could be interested in from our different sources is gathered in one place and we can see its arrangement here.
+
+```{r}
+
+glimpse(toplist)
+
+```
+
+#Analysing data geografically
+
+As seen above we have over 3000 observations with 27 variables but it is worth to note that some song appear in more than one nations toplist, we can see this by looking at a table of how many times the most common songs appear below in table 1.
+
+```{r}
+#Makes table of the songs that appear most times in all the playlists
+toplist %>% group_by(artist_name, track_name) %>%
+  tally() %>% 
+  arrange(desc(n)) %>% 
+  head() %>% 
+  kable(caption = " Table 1: Most common songs in playlists",
+        col.names = c("Artist", "Song", "Appearances"))
+  
+```
+
+We can see from table 1 above that the top songs appear quite a few times and that they all except Taki taki are in english which is quite expected as it is a language alot of countries has as second language.
+
+We'll continue by analysing the music by looking at the variable valence, this is spotify's measure of how positive the sound of a song is, each song is given a value between 0 and 1 with a higher score indicating a more positive sound. Let's see which countries playlists are the most and least happy on average using this metric in figure 1 below.
+
+```{r}
+#Make a new dataframe with valence summerised to the average for each nations playlist
+ nation_valence<- toplist %>% group_by(playlist_name) %>% 
+  summarize(avg_valence = mean(valence)) %>% 
+  arrange(desc(avg_valence))
+
+
+#plots the top and bottom 5 average valence scoring nations
+nation_valence %>% filter(min_rank(avg_valence) <= 5 | min_rank(-avg_valence) <= 5) %>% 
+  ggplot(aes(x = fct_reorder(playlist_name, avg_valence), y = avg_valence)) + 
+  geom_col() +
+  coord_flip() +
+  ylab("Average valence") +
+  xlab("Country") +
+  ggtitle("Figure 1: Top and bottom 5 average valence of countries")
+
+```
+
+We see from figure 1 that the difference in average valence is quite big for the top and bottom 5 countries considering it is on a scale from 0 to 1. We also note that the 5 countries with highest average valence are all located in South America. This poses the question, is the geografical location of a nation indicitive of its playlists average valence? To examine this we make a choropleth below in figure 2.
+
+
+
+```{r, message = FALSE}
+#Use the package rworldmap to make a choropleth
+
+
+#We create the map by joining our data to the worldmap data
+valence_map <- joinCountryData2Map(nation_valence,
+                                   nameJoinColumn = "playlist_name",
+                                   joinCode = "NAME")
+
+
+
+#plots a choropleth of the world coloured with average valence
+mapCountryData(valence_map, nameColumnToPlot = "avg_valence",
+               catMethod = "fixedWidth",
+               numCats = 20,
+               mapTitle = "Figure 2: Average valence by country")
+
+```
+
+As we see in figure 2 above the pattern we saw in figure 1 of South American nations having high average valence is true, we can also see that North America and northern Europe seems to have a lower average valence.
+
+By studying the choroplet above we see that South America has a very high average valence as does Mexico and Spain, since most of these countries speaks mainly spanish or its sister language portugese the question of whether songs in certain languages are more positive than others arises. We examine this by illustrating the average valence for each language below, we only look at languages with atleast 10 songs sung in that language.
+
+```{r}
+#plot the average valence if languages with more than 10 songs, ordered by average valence
+
+toplist %>% group_by(language) %>% 
+  mutate(count = n()) %>% 
+  filter(count >= 10) %>% 
+  summarize(avg_valence = mean(valence)) %>% 
+  arrange(desc(avg_valence)) %>% 
+  subset(!is.na(language)) %>% 
+  ggplot(aes(x = fct_reorder(language, avg_valence), y = avg_valence)) +
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Figure 3: Average valence of songs based on language") +
+  xlab("Language") +
+  ylab("Average valence")
+
+```
+
+We see above in figure 3 that it does indeed seems as if songs in certain languages are more positive than other based on valence, we see that spanish indeed is the most positive language and portugese is quite positive aswell while we see that the most common language english has an average valence that is lower than most languages. The least positive language by far thought is tagalog, a language spoken in the Philippines.
+
+Further in our analysis of the joyfulness of music in different countries I thought it would be interesting to see if this measure of the happiness of music could be used to predict the score a country has in the world happiness report. This report scores countries happiness based on things like GDP per capita, social support, healthy life expectancy among other things, with a high score indication greater nationwide happiness. You can read more about this at https://en.wikipedia.org/wiki/World_Happiness_Report. We illustrate this below in figure 4.
+
+
+```{r}
+#plot the relationship between average valence and WHR score
+
+toplist %>% group_by(playlist_name, Score) %>%
+  summarise(avg_valence=mean(valence)) %>% 
+  ggplot(aes(x = avg_valence, y= Score)) +
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE) +
+  ggtitle("Figure 4: Nations WHR score versus average spotify playlist valence") +
+  xlab("Average valence") +
+  ylab("WHR score")
+
+```
+
+In figure 4 above we see that unfortounately but maybe not unexpectedly we cannot say much about a nations WHR score based on the average valence of its playlist on spotify.
+
+If you find a playlist you like and would like to find other countries playlists similar to it you can group the playlists based on clustering and visualize it with a dendrogram. For this we use all of the available numeric variables in our data to make the likeness of the playlists as good as possible.
+
+```{r}
+#Dendrogram
+
+#Remove the unwanted columns of for example song and artist name and summarise all songs features for each 
+#contries playlist
+toplists_summarised <- toplist %>% 
+  select(-c(2:4, 7, 9, 18:27)) %>% 
+  group_by(playlist_name) %>% 
+  summarise_all(funs(mean))
+
+#transform toplist_summarised to dataframe with countries as column names and average variables as values
+#and scale it to make it suitable for clustering
+X <- toplists_summarised %>% 
+  melt(id.vars = "playlist_name") %>% 
+  spread(playlist_name, value = value) %>% 
+  select(-variable) %>% 
+  scale()
+
+#Cluster the scaled data and plot dendrogram
+hclust(dist(t(X))) %>% 
+  ggdendrogram() +
+  ggtitle("Figure 5: Dendrogram of nation playlists") +
+  theme(axis.ticks.y = element_blank())
+
+```
+
+Based on this figure we can see that for example if you like Uruguays playlist you may also suprisingly like Latvias playlist. 
+
+From the examination and illustrations of the playlists from different nations based on valence one can conclude that if you are looking for positive music on spotify a good place to start is top 50 playlist from South American countries or songs that are in spanish.
+
+#Analysing data based on genres
+
+What if we divide our observations into genres instead of looking at them based on which countries playlist they are from? In this section we will examine this again using spotify's measure of positiveness: valence, aswell as the average sentiment of a song. To measure the average sentiment of a song we will use the AFINN lexicon from the package tidytext found at https://cran.r-project.org/web/packages/tidytext/index.html. The AFINN lexicon rates the valence of words with an integer from -5 to 5, positive values for positive words and vice versa. It did not make sense to use this measure in previous section as we only have the sentiment for songs in english. 
+
+Next we'll take a look at the distribution of spotify's valence and the sentiment of our genres in figure 6 below. We will rescale the sentiment variable to be on a 0-1 scale to match with our valence variable.
+
+
+```{r}
+#rescale sentiment to 0-1 variable usings packages scales and filter for songs 
+#we have the sentiment score of.
+
+g_scores <- toplist %>% 
+  mutate(sentiment = rescale(sentiment, c(0,1))) %>% 
+  filter(!is.na(sentiment))
+
+
+#Create density plots for each genre with sentiment and valence overlapping
+rock_plot <- g_scores %>% 
+  filter(rock == 1) %>% 
+  select(valence, sentiment) %>% 
+  melt(id.var = 0) %>% 
+  ggplot() +
+  geom_density(aes(x = value, fill = variable), alpha = 0.5) +
+  labs(fill = "Measure") +
+  ggtitle("Rock")
+
+pop_plot <- g_scores %>% 
+  filter(pop == 1) %>% 
+  select(valence, sentiment) %>% 
+  melt(id.var = 0) %>% 
+  ggplot() +
+  geom_density(aes(x = value, fill = variable), alpha = 0.5) +
+  labs(fill = "Measure") +
+  ggtitle("Pop")
+
+hip_hop_plot <- g_scores %>% 
+  filter(`hip hop` == 1) %>% 
+  select(valence, sentiment) %>% 
+  melt(id.var = 0) %>% 
+  ggplot() +
+  geom_density(aes(x = value, fill = variable), alpha = 0.5) +
+  labs(fill = "Measure") +
+  ggtitle("Hip hop")
+
+electro_plot <- g_scores %>% 
+  filter(electro == 1) %>% 
+  select(valence, sentiment) %>% 
+  melt(id.var = 0) %>% 
+  ggplot() +
+  geom_density(aes(x = value, fill = variable), alpha = 0.5) +
+  labs(fill = "Measure") +
+  ggtitle("Electro")
+
+
+rnb_plot <- g_scores %>% 
+  filter(rnb == 1) %>% 
+  select(valence, sentiment) %>% 
+  melt(id.var = 0) %>% 
+  ggplot() +
+  geom_density(aes(x = value, fill = variable), alpha = 0.5) +
+  labs(fill = "Measure") +
+  ggtitle("R&B")
+
+#put all genre density plots in a 3x2 grid using package gridExtra
+grid.arrange(rock_plot, pop_plot, hip_hop_plot,
+             electro_plot, rnb_plot,
+             nrow = 3, ncol = 2, top = "Figure 6: Valence and sentiment density of genres")
+
+
+```
+
+We can see from figure 6 above that for genres like rock, electro and somewhat pop the densities of valence and sentiment seem to be quite similar while R&Bs valence seems to be low but sentiment very high. Overall it looks like electro might be the most positive while R&B seems to have the most positive lyrics.
+
+Since figure 6 seems to indicate that R&B has the most positive lyrics lets take a look at what the most common words in that genre is.
+
+```{r}
+#Take all distinct stopwords from dataframe stop_words included in package tidytext
+stopwords <- stop_words %>% select(word) %>% distinct()
+
+#summarises all lyrics of song with genre rnb into one, splits into 1 column with 1 word in each row
+#changes all lettering to small and replaces everything except alphanumric signs and apostrophes with an
+#empty string and counts the number of times any word appears 
+
+common_words <- toplist %>% filter(!is.na(sentiment), rnb == 1) %>% 
+  select(lyric) %>% 
+  mutate(lyric = paste0(lyric, sep = " ", collapse ="")) %>% 
+  separate_rows(lyric, sep = " ") %>% 
+  mutate(lyric = str_replace_all(sapply(lyric,tolower),
+                                 pattern = "[^[:alnum:]']", replacement = "")) %>%
+  subset(!lyric == "") %>% 
+  anti_join(stopwords, by = c("lyric" = "word")) %>% 
+  group_by(lyric) %>% 
+  summarise(n = n()) 
+  
+#plots a wordclould based on frequency of words using package wordcloud
+wordcloud(words = common_words$lyric, freq = common_words$n,
+          random.order = FALSE, 
+          color = c("cadetblue", "coral2", "green", "orange", "brown", "antiquewhite4"), 
+          rot.per = 0.3)
+
+```
+
+We see in the wordcloud that there indeed seems to be quite alot of positive words with love being the most used word of all.
+
+Finally we'll use both of our happiness metrics to determine what genre is the overall most happy, for this I've decided that we will use the metric total average valence with I define as the average spotify valence plus the average sentiment rescaled to the same scale as valence per genre. We will illustrate this below in figure 7.
+
+```{r}
+#Change dataframe to that genres are categories of a variable instead of all
+#genres being its own 0-1 variable. Summarise sentiment and valence for each genre, adds them
+#and plot ordered after highest total average valence
+toplist %>% 
+  filter(!is.na(sentiment)) %>% 
+  select(track_name,artist_name,rock, pop, `hip hop`, electro, rnb) %>%
+  melt(id.vars = c(1:2)) %>% 
+  filter(value == 1) %>% 
+  select(-value) %>% 
+  left_join(toplist, by = c("artist_name", "track_name")) %>% 
+  mutate(sentiment = rescale(sentiment, c(0,1))) %>% 
+  group_by(variable) %>% 
+  summarise(avg_val = mean(valence), avg_sent = mean(sentiment), n = n()) %>% 
+  mutate(avg_total = avg_val + avg_sent) %>% 
+  arrange(desc(avg_total)) %>% 
+  ggplot(aes(x = fct_reorder(variable, avg_total), y = avg_total)) +
+  geom_col() +
+  ggtitle("Figure 7: Average total valence of genres") +
+  xlab("Genre") +
+  ylab("Average total valence") +
+  scale_x_discrete(labels = c("Rock", "Hip Hop", "Pop", "Electro", "R&B"))
+
+```
+
+As we see in figure 7 above the genre with highest total valence is R&B but quite a margin, so if you're looking for music that has a positive sound aswell as positive lyrics your best bet is to look for songs in the R&B genre.
+
+Sources of information used include:
+
+Spotify's web API. https://developer.spotify.com/documentation/web-api/
+
+Wikipedia. "The world happines report" https://en.wikipedia.org/wiki/World_Happiness_Report
+
+Wikipedia. "List of popular music genres" https://en.wikipedia.org/wiki/List_of_popular_music_genres
+           
+R for Data Science, Garret Grolemund, Hadley Wickham. "https://r4ds.had.co.nz/"
+
+
+
+
